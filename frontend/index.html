@@ -1,1 +1,456 @@
---
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Zero-Knowledge Vault</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#f4f6f8; margin:0; color:#1f2937; }
+    .wrap { max-width: 980px; margin: 40px auto; padding: 0 16px; }
+    .card { background:#fff; padding:20px; border-radius:12px; box-shadow: 0 4px 18px rgba(0,0,0,.08); }
+    .narrow { max-width: 420px; margin: 0 auto; }
+    input, button { width:100%; padding:10px; margin-top:10px; box-sizing:border-box; }
+    button { cursor: pointer; }
+    .err { background:#ffe8e8; color:#7a0000; padding:10px; border-radius:8px; margin-top:10px; display:none; }
+    .ok { background:#e8fff0; color:#0b5a25; padding:10px; border-radius:8px; margin-top:10px; display:none; }
+    a { color:#0b62d6; cursor:pointer; text-decoration:none; }
+    a:hover { text-decoration: underline; }
+    img { max-width: 200px; display:block; margin: 10px auto; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+    .panel { border:1px solid #e5e7eb; border-radius:10px; padding:16px; }
+    .row { display:flex; gap:8px; }
+    .row > * { flex:1; }
+    .muted { color:#6b7280; font-size: 14px; }
+    .status { padding:8px 10px; border-radius:8px; display:inline-block; margin-top:8px; }
+    .locked { background:#fee2e2; color:#991b1b; }
+    .unlocked { background:#dcfce7; color:#166534; }
+    table { width:100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border-bottom:1px solid #e5e7eb; padding:8px; text-align:left; vertical-align: top; }
+    code { background:#f3f4f6; padding:2px 5px; border-radius:4px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div id="view"></div>
+  </div>
+</div>
+
+<script>
+  const API = "http://127.0.0.1:8000";
+  const view = document.getElementById("view");
+  let vaultState = { unlocked: false, keyBytes: null, key: null, saltB64: null, configured: false };
+
+  function esc(s){ return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
+  function render(html){ view.innerHTML = html; }
+  function showMsg(type, text){
+    const box = document.querySelector(type === 'err' ? '#err' : '#ok');
+    if(!box) return;
+    box.style.display = 'block';
+    box.textContent = text;
+  }
+  function bytesToB64(bytes){ let s=''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); }
+  function b64ToBytes(b64){ const s = atob(b64); const out = new Uint8Array(s.length); for(let i=0;i<s.length;i++) out[i]=s.charCodeAt(i); return out; }
+  function hex(bytes){ return Array.from(bytes).map(x=>x.toString(16).padStart(2,'0')).join(''); }
+
+  async function api(path, method='GET', body=null, formData=null){
+    const opts = { method, credentials:'include', headers:{} };
+    if(body){ opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    if(formData){ opts.body = formData; }
+    const r = await fetch(API + path, opts);
+    const ct = r.headers.get('content-type') || '';
+    let data = {};
+    if(ct.includes('application/json')) data = await r.json().catch(()=>({}));
+    if(!r.ok){ throw new Error(data.detail || 'Ошибка запроса'); }
+    return { response: r, data };
+  }
+
+  async function sha256Bytes(bytes){
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    return new Uint8Array(hash);
+  }
+
+  async function deriveVaultMaterial(password, saltBytes){
+    const enc = new TextEncoder();
+    const baseKey = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name:'PBKDF2', salt: saltBytes, iterations:310000, hash:'SHA-256' }, baseKey, 256);
+    const keyBytes = new Uint8Array(bits);
+    const verifierBytes = await sha256Bytes(keyBytes);
+    const aesKey = await crypto.subtle.importKey('raw', keyBytes, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+    return { keyBytes, verifierB64: bytesToB64(verifierBytes), aesKey };
+  }
+
+  async function encryptBytes(plainBytes){
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const cipher = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, vaultState.key, plainBytes);
+    const out = new Uint8Array(iv.length + cipher.byteLength);
+    out.set(iv, 0);
+    out.set(new Uint8Array(cipher), iv.length);
+    return out;
+  }
+
+  async function decryptBytes(containerBytes){
+    const iv = containerBytes.slice(0, 12);
+    const ciphertext = containerBytes.slice(12);
+    const plain = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, vaultState.key, ciphertext);
+    return new Uint8Array(plain);
+  }
+
+  async function refreshVaultInfo(){
+    const {data} = await api('/api/vault/info');
+    vaultState.configured = !!data.configured;
+    vaultState.saltB64 = data.salt || null;
+    return data;
+  }
+
+  function nav(){
+    const hash = location.hash || '#login';
+    if(hash === '#register') return pageRegister();
+    if(hash === '#totp') return pageTotp();
+    if(hash === '#dashboard') return pageDashboard();
+    return pageLogin();
+  }
+
+  function pageLogin(){
+    render(`
+      <div class="narrow">
+        <h2>Вход</h2>
+        <div id="err" class="err"></div>
+        <div id="ok" class="ok"></div>
+        <input id="u" placeholder="Username" />
+        <input id="p" type="password" placeholder="Password" />
+        <button id="btn">Login</button>
+        <hr/>
+        <button id="google">Login with Google (SSO)</button>
+        <p><a href="#register">Создать аккаунт</a></p>
+        <p class="muted">JWT хранится в HttpOnly cookie, фронтенд его не видит.</p>
+      </div>
+    `);
+    document.getElementById('btn').onclick = async () => {
+      try{
+        const username = document.getElementById('u').value.trim();
+        const password = document.getElementById('p').value;
+        const {data:res} = await api('/api/login', 'POST', {username, password});
+        if(res.next === 'totp'){
+          sessionStorage.setItem('pending_user', username);
+          location.hash = '#totp';
+        } else {
+          location.hash = '#dashboard';
+        }
+      }catch(e){ showMsg('err', e.message); }
+    };
+    document.getElementById('google').onclick = () => { window.location.href = API + '/api/sso/google'; };
+  }
+
+  function pageRegister(){
+    render(`
+      <div class="narrow">
+        <h2>Регистрация</h2>
+        <div id="err" class="err"></div>
+        <div id="ok" class="ok"></div>
+        <input id="u" placeholder="Username (>=3)" />
+        <input id="p" type="password" placeholder="Password (>=8)" />
+        <button id="btn">Create</button>
+        <div id="qrbox" style="display:none">
+          <h3 style="text-align:center">2FA (TOTP)</h3>
+          <img id="qr" alt="QR"/>
+          <small>Secret: <span id="sec"></span></small>
+          <p><a href="#login">Перейти к входу</a></p>
+        </div>
+        <p><a href="#login">Назад</a></p>
+      </div>
+    `);
+    document.getElementById('btn').onclick = async () => {
+      try{
+        const username = document.getElementById('u').value.trim();
+        const password = document.getElementById('p').value;
+        const {data:res} = await api('/api/register', 'POST', {username, password});
+        const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(res.otpauth_uri);
+        document.getElementById('qr').src = qrUrl;
+        document.getElementById('sec').textContent = res.totp_secret;
+        document.getElementById('qrbox').style.display = 'block';
+        showMsg('ok', 'Аккаунт создан. Отсканируй QR в Authenticator.');
+      }catch(e){ showMsg('err', e.message); }
+    };
+  }
+
+  function pageTotp(){
+    const pending = sessionStorage.getItem('pending_user') || '';
+    render(`
+      <div class="narrow">
+        <h2>Подтверждение OTP</h2>
+        <div id="err" class="err"></div>
+        <div id="ok" class="ok"></div>
+        <p>Пользователь: <b>${esc(pending)}</b></p>
+        <input id="c" placeholder="123456" />
+        <button id="btn">Verify</button>
+        <p><a href="#login">Назад</a></p>
+      </div>
+    `);
+    document.getElementById('btn').onclick = async () => {
+      try{
+        const code = document.getElementById('c').value.trim();
+        const username = pending;
+        await api('/api/totp', 'POST', {username, code});
+        sessionStorage.removeItem('pending_user');
+        location.hash = '#dashboard';
+      }catch(e){ showMsg('err', e.message); }
+    };
+  }
+
+  async function pageDashboard(){
+    render(`
+      <h2>Личный кабинет</h2>
+      <div id="err" class="err"></div>
+      <div id="ok" class="ok"></div>
+      <div id="me"></div>
+      <div class="row" style="max-width: 300px; margin-top: 12px;">
+        <button id="logout">Logout</button>
+      </div>
+      <hr/>
+      <div class="grid">
+        <div class="panel">
+          <h3>Хранилище</h3>
+          <p id="vault-status-line" class="status locked">🔒 Хранилище заблокировано</p>
+          <p id="vault-hint" class="muted"></p>
+          <input id="vault-pass" type="password" placeholder="Пароль хранилища" />
+          <div class="row">
+            <button id="vault-unlock-btn">Разблокировать</button>
+            <button id="vault-lock-btn">Заблокировать</button>
+          </div>
+          <input id="file-input" type="file" />
+          <button id="upload-btn">Загрузить файл</button>
+          <p class="muted">Пароль хранилища отдельный от пароля учетной записи и не отправляется на сервер.</p>
+        </div>
+        <div class="panel">
+          <h3>Пользователь</h3>
+          <div id="user-box"></div>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px;">
+        <h3>Файлы</h3>
+        <div id="files-box"></div>
+      </div>
+      <div class="panel" style="margin-top:16px;">
+        <h3>Журнал событий безопасности</h3>
+        <div id="audit-box"></div>
+      </div>
+    `);
+
+    try{
+      const {data:me} = await api('/api/me');
+      document.getElementById('me').innerHTML = `
+        <p><b>username:</b> ${esc(me.username)}</p>
+        <p><b>email:</b> ${esc(me.email || '-')}</p>
+        <p><b>sso:</b> ${esc(me.sso_provider || '-')}</p>
+      `;
+      document.getElementById('user-box').innerHTML = `
+        <p><b>Имя пользователя:</b> ${esc(me.username)}</p>
+        <p><b>Vault настроен:</b> ${me.vault_configured ? 'да' : 'нет'}</p>
+      `;
+      const info = await refreshVaultInfo();
+      document.getElementById('vault-hint').textContent = info.configured
+        ? 'Введите существующий пароль хранилища для доступа к файлам.'
+        : 'Хранилище еще не настроено. При первой разблокировке будет создан новый пароль хранилища.';
+      updateVaultStatus();
+      await refreshFiles();
+      await refreshAudit();
+    }catch(e){
+      showMsg('err', e.message);
+      location.hash = '#login';
+      return;
+    }
+
+    document.getElementById('logout').onclick = async () => {
+      try{ await api('/api/logout', 'POST'); } catch(e){}
+      vaultState = { unlocked:false, keyBytes:null, key:null, saltB64:null, configured:false };
+      location.hash = '#login';
+    };
+
+    document.getElementById('vault-unlock-btn').onclick = unlockVault;
+    document.getElementById('vault-lock-btn').onclick = lockVault;
+    document.getElementById('upload-btn').onclick = uploadCurrentFile;
+  }
+
+  function updateVaultStatus(){
+    const el = document.getElementById('vault-status-line');
+    if(!el) return;
+    if(vaultState.unlocked){
+      el.textContent = '🔓 Хранилище разблокировано';
+      el.className = 'status unlocked';
+    } else {
+      el.textContent = '🔒 Хранилище заблокировано';
+      el.className = 'status locked';
+    }
+  }
+
+  async function unlockVault(){
+    try{
+      const pass = document.getElementById('vault-pass').value;
+      if(!pass) throw new Error('Введи пароль хранилища');
+      const info = await refreshVaultInfo();
+      let saltBytes;
+      let material;
+      if(info.configured){
+        saltBytes = b64ToBytes(info.salt);
+        material = await deriveVaultMaterial(pass, saltBytes);
+        await api('/api/vault/verify', 'POST', { verifier: material.verifierB64 });
+      } else {
+        saltBytes = crypto.getRandomValues(new Uint8Array(16));
+        material = await deriveVaultMaterial(pass, saltBytes);
+        await api('/api/vault/setup', 'POST', { salt: bytesToB64(saltBytes), verifier: material.verifierB64 });
+        await refreshVaultInfo();
+      }
+      vaultState.unlocked = true;
+      vaultState.keyBytes = material.keyBytes;
+      vaultState.key = material.aesKey;
+      updateVaultStatus();
+      showMsg('ok', 'Хранилище разблокировано');
+      await refreshFiles();
+      await refreshAudit();
+    }catch(e){
+      vaultState.unlocked = false;
+      vaultState.keyBytes = null;
+      vaultState.key = null;
+      updateVaultStatus();
+      showMsg('err', e.message);
+    }
+  }
+
+  function lockVault(){
+    vaultState.unlocked = false;
+    vaultState.keyBytes = null;
+    vaultState.key = null;
+    const input = document.getElementById('vault-pass');
+    if(input) input.value = '';
+    updateVaultStatus();
+    const ok = document.querySelector('#ok');
+    if(ok){ ok.style.display = 'block'; ok.textContent = 'Хранилище заблокировано'; }
+  }
+
+  async function uploadCurrentFile(){
+    try{
+      if(!vaultState.unlocked || !vaultState.key) throw new Error('Сначала разблокируй хранилище');
+      const input = document.getElementById('file-input');
+      const file = input.files[0];
+      if(!file) throw new Error('Выбери файл');
+      const plainBytes = new Uint8Array(await file.arrayBuffer());
+      const plainHash = hex(await sha256Bytes(plainBytes));
+      const containerBytes = await encryptBytes(plainBytes);
+      const form = new FormData();
+      form.append('file', new Blob([containerBytes], {type:'application/octet-stream'}), 'ciphertext.bin');
+      form.append('original_filename', file.name);
+      form.append('plaintext_sha256', plainHash);
+      await api('/api/files/upload', 'POST', null, form);
+      input.value = '';
+      showMsg('ok', 'Файл загружен в зашифрованном виде');
+      await refreshFiles();
+      await refreshAudit();
+    }catch(e){ showMsg('err', e.message); }
+  }
+
+  async function refreshFiles(){
+    const box = document.getElementById('files-box');
+    if(!box) return;
+    try{
+      const {data} = await api('/api/files');
+      const items = data.items || [];
+      if(!items.length){ box.innerHTML = '<p class="muted">Файлов пока нет.</p>'; return; }
+      box.innerHTML = `
+        <table>
+          <thead><tr><th>ID</th><th>Имя</th><th>Размер контейнера</th><th>Дата</th><th>Действия</th></tr></thead>
+          <tbody>
+            ${items.map(item => `
+              <tr>
+                <td>${item.id}</td>
+                <td>${esc(item.orig_filename)}</td>
+                <td>${item.size_bytes}</td>
+                <td>${esc(item.uploaded_at)}</td>
+                <td>
+                  <button onclick="downloadFile(${item.id})">Скачать</button>
+                  <button onclick="checkIntegrity(${item.id})">Проверить</button>
+                  <button onclick="deleteFile(${item.id})">Удалить</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `;
+    }catch(e){ box.innerHTML = `<div class="err" style="display:block">${esc(e.message)}</div>`; }
+  }
+
+  async function refreshAudit(){
+    const box = document.getElementById('audit-box');
+    if(!box) return;
+    try{
+      const {data} = await api('/api/audit');
+      const items = data.items || [];
+      if(!items.length){ box.innerHTML = '<p class="muted">Журнал пока пуст.</p>'; return; }
+      box.innerHTML = `
+        <table>
+          <thead><tr><th>Время</th><th>Событие</th><th>Статус</th><th>Описание</th></tr></thead>
+          <tbody>
+            ${items.map(item => `
+              <tr>
+                <td>${esc(item.created_at)}</td>
+                <td>${esc(item.event_type)}</td>
+                <td>${esc(item.status)}</td>
+                <td>${esc(item.details || '')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `;
+    }catch(e){ box.innerHTML = `<div class="err" style="display:block">${esc(e.message)}</div>`; }
+  }
+
+  async function checkIntegrity(id){
+    try{
+      const {data} = await api(`/api/files/${id}/check-integrity`, 'POST');
+      if(data.ok) showMsg('ok', 'Целостность контейнера подтверждена');
+      else showMsg('err', 'Нарушена целостность контейнера');
+      await refreshAudit();
+    }catch(e){ showMsg('err', e.message); }
+  }
+
+  async function deleteFile(id){
+    try{
+      await api(`/api/files/${id}`, 'DELETE');
+      showMsg('ok', 'Файл удален');
+      await refreshFiles();
+      await refreshAudit();
+    }catch(e){ showMsg('err', e.message); }
+  }
+
+  async function downloadFile(id){
+    try{
+      if(!vaultState.unlocked || !vaultState.key) throw new Error('Сначала разблокируй хранилище');
+      const r = await fetch(API + `/api/files/${id}/download`, { credentials:'include' });
+      if(!r.ok){
+        const err = await r.json().catch(()=>({}));
+        throw new Error(err.detail || 'Ошибка скачивания');
+      }
+      const origName = r.headers.get('X-Orig-Filename') || 'file';
+      const buf = new Uint8Array(await r.arrayBuffer());
+      const plainBytes = await decryptBytes(buf);
+      const blob = new Blob([plainBytes], {type:'application/octet-stream'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = origName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
+      showMsg('ok', 'Файл расшифрован и скачан');
+      await refreshAudit();
+    }catch(e){ showMsg('err', e.message); }
+  }
+
+  window.addEventListener('hashchange', nav);
+  window.downloadFile = downloadFile;
+  window.checkIntegrity = checkIntegrity;
+  window.deleteFile = deleteFile;
+  nav();
+</script>
+</body>
+</html>
