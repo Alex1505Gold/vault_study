@@ -1,1 +1,8 @@
-
+fastapi
+uvicorn
+python-jose
+passlib[argon2]
+python-dotenv
+pyotp
+authlib
+python-multipart
