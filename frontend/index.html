@@ -121,7 +121,7 @@
         <input id="p" type="password" placeholder="Password" />
         <button id="btn">Login</button>
         <hr/>
-        <button id="google">Login with Google (SSO)</button>
+        <button id="keycloak">Войти через Keycloak (SSO)</button>
         <p><a href="#register">Создать аккаунт</a></p>
         <p class="muted">JWT хранится в HttpOnly cookie, фронтенд его не видит.</p>
       </div>
@@ -139,7 +139,7 @@
         }
       }catch(e){ showMsg('err', e.message); }
     };
-    document.getElementById('google').onclick = () => { window.location.href = API + '/api/sso/google'; };
+    document.getElementById('keycloak').onclick = () => { window.location.href = API + '/api/sso/keycloak'; };
   }
 
   function pageRegister(){
