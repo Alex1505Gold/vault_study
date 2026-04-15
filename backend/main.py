@@ -29,10 +29,19 @@ from store import (
 config = dotenv_values('.env')
 FRONTEND_URL = config.get('FRONTEND_URL', 'http://127.0.0.1:5500')
 SESSION_SECRET = config.get('SESSION_SECRET', 'CHANGE_ME_SESSION_SECRET')
-GOOGLE_CLIENT_ID = config.get('GOOGLE_CLIENT_ID', '')
-GOOGLE_CLIENT_SECRET = config.get('GOOGLE_CLIENT_SECRET', '')
+# GOOGLE_CLIENT_ID = config.get('GOOGLE_CLIENT_ID', '')
+# GOOGLE_CLIENT_SECRET = config.get('GOOGLE_CLIENT_SECRET', '')
 COOKIE_NAME = 'access_token'
 MAX_FILE_SIZE_BYTES = int(config.get('MAX_FILE_SIZE_BYTES', str(20 * 1024 * 1024)))
+
+KEYCLOAK_SERVER_URL = config.get("KEYCLOAK_SERVER_URL", "http://127.0.0.1:8080")
+KEYCLOAK_REALM = config.get("KEYCLOAK_REALM", "master")
+KEYCLOAK_CLIENT_ID = config.get("KEYCLOAK_CLIENT_ID", "")
+KEYCLOAK_CLIENT_SECRET = config.get("KEYCLOAK_CLIENT_SECRET", "")
+
+KEYCLOAK_DISCOVERY_URL = (
+    f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}/.well-known/openid-configuration"
+)
 
 app = FastAPI(title='Zero-Knowledge Vault Backend')
 init_db()
@@ -47,14 +56,23 @@ app.add_middleware(
 )
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 
+# oauth = OAuth()
+# if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+#     oauth.register(
+#         name='google',
+#         client_id=GOOGLE_CLIENT_ID,
+#         client_secret=GOOGLE_CLIENT_SECRET,
+#         server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+#         client_kwargs={'scope': 'openid email profile'},
+#     )
 oauth = OAuth()
-if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+if KEYCLOAK_CLIENT_ID and KEYCLOAK_CLIENT_SECRET:
     oauth.register(
-        name='google',
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-        client_kwargs={'scope': 'openid email profile'},
+        name="keycloak",
+        client_id=KEYCLOAK_CLIENT_ID,
+        client_secret=KEYCLOAK_CLIENT_SECRET,
+        server_metadata_url=KEYCLOAK_DISCOVERY_URL,
+        client_kwargs={"scope": "openid email profile"},
     )
 
 
@@ -315,29 +333,73 @@ async def api_audit(request: Request):
     return {'items': get_audit_for_user(user['username'])}
 
 
-@app.get('/api/sso/google')
-async def sso_google(request: Request):
-    if 'google' not in oauth._clients:
-        raise HTTPException(500, 'Google SSO не настроен (нет GOOGLE_CLIENT_ID/SECRET)')
-    redirect_uri = request.url_for('sso_google_callback')
-    return await oauth.google.authorize_redirect(request, redirect_uri)
+# @app.get('/api/sso/google')
+# async def sso_google(request: Request):
+#     if 'google' not in oauth._clients:
+#         raise HTTPException(500, 'Google SSO не настроен (нет GOOGLE_CLIENT_ID/SECRET)')
+#     redirect_uri = request.url_for('sso_google_callback')
+#     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 
-@app.get('/api/sso/google/callback')
-async def sso_google_callback(request: Request):
-    if 'google' not in oauth._clients:
-        raise HTTPException(500, 'Google SSO не настроен')
-    token = await oauth.google.authorize_access_token(request)
-    userinfo = token.get('userinfo')
+# @app.get('/api/sso/google/callback')
+# async def sso_google_callback(request: Request):
+#     if 'google' not in oauth._clients:
+#         raise HTTPException(500, 'Google SSO не настроен')
+#     token = await oauth.google.authorize_access_token(request)
+#     userinfo = token.get('userinfo')
+#     if not userinfo:
+#         userinfo = await oauth.google.parse_id_token(request, token)
+#     email = userinfo.get('email')
+#     if not email:
+#         raise HTTPException(400, 'SSO не вернул email')
+#     username_hint = (userinfo.get('given_name') or userinfo.get('name') or 'user').lower().replace(' ', '')
+#     user = create_or_update_user_sso(provider='google', email=email, username_hint=username_hint)
+#     jwt_token = create_token(user['username'])
+#     resp = RedirectResponse(url=f'{FRONTEND_URL}/#dashboard', status_code=302)
+#     set_auth_cookie(resp, jwt_token)
+#     log_event(user['username'], 'login_sso', 'success', 'google login')
+#     return resp
+
+@app.get("/api/sso/keycloak")
+async def sso_keycloak(request: Request):
+    if "keycloak" not in oauth._clients:
+        raise HTTPException(500, "Keycloak SSO не настроен")
+
+    redirect_uri = request.url_for("sso_keycloak_callback")
+    return await oauth.keycloak.authorize_redirect(request, redirect_uri)
+
+@app.get("/api/sso/keycloak/callback")
+async def sso_keycloak_callback(request: Request):
+    if "keycloak" not in oauth._clients:
+        raise HTTPException(500, "Keycloak SSO не настроен")
+
+    token = await oauth.keycloak.authorize_access_token(request)
+
+    userinfo = token.get("userinfo")
     if not userinfo:
-        userinfo = await oauth.google.parse_id_token(request, token)
-    email = userinfo.get('email')
+        # fallback: иногда userinfo надо брать отдельно или из id_token
+        userinfo = await oauth.keycloak.parse_id_token(request, token)
+
+    email = userinfo.get("email")
+    preferred_username = userinfo.get("preferred_username")
+    full_name = userinfo.get("name")
+
     if not email:
-        raise HTTPException(400, 'SSO не вернул email')
-    username_hint = (userinfo.get('given_name') or userinfo.get('name') or 'user').lower().replace(' ', '')
-    user = create_or_update_user_sso(provider='google', email=email, username_hint=username_hint)
-    jwt_token = create_token(user['username'])
-    resp = RedirectResponse(url=f'{FRONTEND_URL}/#dashboard', status_code=302)
+        raise HTTPException(400, "Keycloak не вернул email")
+
+    username_hint = (
+        preferred_username
+        or (full_name or "user").lower().replace(" ", "")
+        or "user"
+    )
+
+    user = create_or_update_user_sso(
+        provider="keycloak",
+        email=email,
+        username_hint=username_hint
+    )
+
+    jwt_token = create_token(user["username"])
+    resp = RedirectResponse(url=f"{FRONTEND_URL}/#dashboard", status_code=302)
     set_auth_cookie(resp, jwt_token)
-    log_event(user['username'], 'login_sso', 'success', 'google login')
     return resp
